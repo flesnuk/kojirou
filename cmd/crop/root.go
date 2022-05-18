@@ -9,6 +9,10 @@ import (
 
 const grayDarknessLimit = 128
 const minDistinctBitsBetweenLines = 1 // minumum Hamming distance between consecutive line hashes to mark as border
+const maxDistinctBitsBetweenLines = 3 // a more general value for generic cases
+const blackHighContrastThreshold = 30
+const whiteHighContrastThreshold = 230
+const highContrastPercent = 12
 
 func Auto(img image.Image) (image.Image, error) {
 	bounds := BoundsHash(img)
@@ -94,17 +98,16 @@ func findBorderUsingAvgHash(img image.Image, dir image.Point) image.Point {
 	bounds := img.Bounds()
 	scan := image.Pt(dir.Y, dir.X)
 	dpt := pointInScanCorner(bounds, dir)
-	rgbimg, _ := img.(image.RGBA64Image)
 
-	prev := lineAverageHash(rgbimg, dpt, scan)
+	prevAvg, prevHighContrast := lineAverageHash(img, dpt, scan)
 	dpt = dpt.Add(dir)
 
 	for {
-		hash := lineAverageHash(rgbimg, dpt, scan)
-		if bits.OnesCount64(hash^prev) >= minDistinctBitsBetweenLines {
+		avgHash, highContrastHash := lineAverageHash(img, dpt, scan)
+		if !hashesMatch(prevAvg, prevHighContrast, avgHash, highContrastHash) {
 			break
 		}
-		prev = hash
+		prevAvg, prevHighContrast = avgHash, highContrastHash
 		dpt = dpt.Add(dir)
 		if !dpt.In(bounds) {
 			dpt = pointInScanCorner(bounds, dir)
@@ -119,16 +122,27 @@ func findBorderUsingAvgHash(img image.Image, dir image.Point) image.Point {
 	}
 }
 
-func lineAverageHash(img image.Image, pt image.Point, scan image.Point) uint64 {
-	var hash uint64
+func hashesMatch(prevAvg uint32, prevHighContrast uint32, avgHash uint32, highContrastHash uint32) bool {
+	// If prev avg was white or black for the full line, use a lower, more sensitive value
+	if (prevAvg^0xFFFFFFFF == 0 || prevAvg^0 == 0) &&
+		bits.OnesCount32(avgHash^prevAvg)+bits.OnesCount32(highContrastHash^prevHighContrast) >= minDistinctBitsBetweenLines {
+		return false
+	}
+	if bits.OnesCount32(avgHash^prevAvg)+bits.OnesCount32(highContrastHash^prevHighContrast) >= maxDistinctBitsBetweenLines {
+		return false
+	}
+	return true
+}
+
+func lineAverageHash(img image.Image, pt image.Point, scan image.Point) (avgHash uint32, highContrastHash uint32) {
 	length := 0
 	if scan.X != 0 {
 		length = img.Bounds().Max.X
 	} else {
 		length = img.Bounds().Max.Y
 	}
-	windowSize := length / 64
-	i := 0
+	windowSize := length / 32
+	i, lows, highs := 0, 0.0, 0.0
 	var partialSum uint32
 
 	for spt := pt; spt.In(img.Bounds()); spt = spt.Add(scan) {
@@ -136,19 +150,38 @@ func lineAverageHash(img image.Image, pt image.Point, scan image.Point) uint64 {
 			if i%windowSize == windowSize-1 {
 				// check if average is "white" and set bit in hash, just before going into next block window.
 				if partialSum > uint32(windowSize)*grayDarknessLimit {
-					hash = setBit64(hash, i/windowSize)
+					avgHash = setBit32(avgHash, i/windowSize)
+					if lows > float64(windowSize)*highContrastPercent/100 {
+						highContrastHash = setBit32(highContrastHash, i/windowSize)
+					}
+				} else {
+					if highs > float64(windowSize)*highContrastPercent/100 {
+						highContrastHash = setBit32(highContrastHash, i/windowSize)
+					}
 				}
-				partialSum = 0
+				partialSum, lows, highs = 0, 0, 0
 			}
 			partialSum += uint32(gray.Y)
+			if gray.Y > whiteHighContrastThreshold {
+				highs++
+			}
+			if gray.Y < blackHighContrastThreshold {
+				lows++
+			}
 			i++
 		}
 	}
-	return hash
+	return
 }
 
 // Sets the bit at pos in the integer n.
 func setBit64(n uint64, pos int) uint64 {
+	n |= (1 << pos)
+	return n
+}
+
+// Sets the bit at pos in the integer n.
+func setBit32(n uint32, pos int) uint32 {
 	n |= (1 << pos)
 	return n
 }
